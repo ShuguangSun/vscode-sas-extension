@@ -44,6 +44,10 @@ export const checkProfileAndAuthorize =
         commands.executeCommand("setContext", "SAS.serverDisplayed", true);
         libraryNavigator.refresh();
         return finishAuthorization(profileConfig);
+      case ConnectionType.SASPY:
+        commands.executeCommand("setContext", "SAS.librariesDisplayed", true);
+        libraryNavigator.refresh();
+        return finishAuthorization(profileConfig);
       default:
         return finishAuthorization(profileConfig);
     }
