@@ -1,6 +1,6 @@
 // Copyright © 2023, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
-import { Uri, workspace } from "vscode";
+import { Uri, env, workspace } from "vscode";
 
 import { ChildProcessWithoutNullStreams, spawn } from "child_process";
 
@@ -11,11 +11,7 @@ import { Session } from "../session";
 import { extractOutputHtmlFileName } from "../util";
 // import { scriptContent } from "./script";
 import { LineParser } from "../itc/LineParser";
-import {
-  WORK_DIR_END_TAG,
-  WORK_DIR_START_TAG,
-} from "../itc/const";
-import { Config, LineCodes } from "./types";
+import { Config, LineCodes, WORK_DIR_END_TAG, WORK_DIR_START_TAG } from "./types";
 import { saspyGetHtmlStyleValue } from "./util";
 
 const LogLineTypes: LogLineTypeEnum[] = [
@@ -54,6 +50,7 @@ export class SASPYSession extends Session {
   private _runResolve: ((value?) => void) | undefined;
   private _runReject: ((reason?) => void) | undefined;
   private _workDirectory: string;
+  private _pendingWorkDirectory: string;
   private _pollingForLogResults: boolean;
   private _logLineType = 0;
   private _workDirectoryParser: LineParser;
@@ -102,6 +99,7 @@ export class SASPYSession extends Session {
     this._shellProcess.stdout.on("data", this.onShellStdOut);
     this._shellProcess.stderr.on("data", this.onShellStdErr);
     const saspyWorkDir = `
+options LOCALE='${env.language.replace("-", "_")}';
 %let __workDir = %sysfunc(pathname(work));
 %put ${WORK_DIR_START_TAG};
 %put &__workDir.;
@@ -114,12 +112,16 @@ run;
     const cfgname =
       this._config.cfgname?.length > 0 ? this._config.cfgname : "";
     const scriptContent = `
-import saspy
-from packaging.version import parse
+try:
+    import saspy
+    from packaging.version import parse
+except ImportError as _e:
+    print("SASPY_IMPORT_ERROR:" + str(_e))
+    raise SystemExit(1)
 
 _cfgname = "${cfgname}"
 
-if(not _cfgname):
+if _cfgname:
     try:
         sas
         if sas is None:
@@ -170,17 +172,6 @@ print("${LineCodes.SessionCreatedCode}")
      * will not exist. The work dir should only be deleted when close is invoked.
      */
     if (!this._workDirectory) {
-      // this._shellProcess.stdin.write(`sas\n`);
-
-      // FIXME: Logically, the code for workdirectory should be here
-      //       this._shellProcess.stdin.write(`
-      // ll_init=sas.submit(vscode_saspy_code)
-      // if ll_init is not None:
-      //     print(ll_init['LOG'])
-      //     ll_init = None
-
-      //               `, this.onWriteComplete);
-
       this._workDirectoryParser.reset();
 
       if (this._config.sasOptions?.length > 0) {
@@ -260,6 +251,31 @@ else:
   };
 
   /**
+   * Executes the given Python code directly in the saspy shell process,
+   * bypassing the full SAS submission pipeline (no ODS modification, no fetchLog polling).
+   * The code parameter should be valid Python that prints its output to stdout.
+   * @param code Python code to execute.
+   * @returns A promise that resolves when the code execution completes.
+   */
+  public execute = async (code: string): Promise<RunResult> => {
+    const runPromise = new Promise<RunResult>((resolve, reject) => {
+      this._runResolve = resolve;
+      this._runReject = reject;
+    });
+
+    this._html5FileName = "";
+    this._pollingForLogResults = true;
+    const codeToExecute = `${code}\nprint(r"""${LineCodes.RunEndCode}""")\n`;
+    this._shellProcess.stdin.write(codeToExecute, async (error) => {
+      if (error) {
+        this._runReject(error);
+      }
+    });
+
+    return runPromise;
+  };
+
+  /**
    * Cleans up resources for the given SAS session.
    * @returns void promise.
    */
@@ -274,6 +290,7 @@ else:
         this._shellProcess = undefined;
 
         this._workDirectory = undefined;
+        this._pendingWorkDirectory = undefined;
         this._runReject = undefined;
         this._runResolve = undefined;
       }
@@ -283,17 +300,54 @@ else:
   };
 
   /**
-   * Cancels a running SAS program
+   * Cancels a running SAS program.
+   *
+   * saspy's submit() blocks until SAS code completes. Writing cancel code to
+   * stdin is ineffective while submit() is blocking. The only way to interrupt
+   * submit() is to send SIGINT to the Python process, which triggers
+   * KeyboardInterrupt — saspy catches it and calls _breakprompt() which:
+   *   - IOM mode:   sas._io.stdcan[0].send(b'C')  — graceful SAS cancel
+   *   - STDIO mode: os.kill(sas._io.pid, SIGINT)   — graceful SAS cancel (Linux/Mac)
+   *   - STDIO Win:  sas._io.pid.kill()             — terminates SAS (saspy limitation)
+   *
+   * After SIGINT, submit() returns with partial log. The queued stdin commands
+   * (fetchLog + RunCancelledCode) then execute, and processLineCodes resolves
+   * the _run promise when RunCancelledCode is detected.
+   *
+   * On Windows, process.kill(pid, 'SIGINT') is unsupported — fallback kills the
+   * shell and rebuilds the connection on next run.
    */
   public cancel = async () => {
     this._pollingForLogResults = false;
-    this._shellProcess.stdin.write(`sas.submit("""\n%abort cancel;\n""")\n`, async (error) => {
-      if (error) {
-        this._runReject(error);
+    try {
+      if (!this._shellProcess || this._shellProcess.killed) {
+        this._runReject?.(new Error("No active SAS session to cancel."));
+        return;
       }
 
-      await this.fetchLog();
-    });
+      // Queue RunCancelledCode to stdin — executes after submit() returns
+      // (interrupted by SIGINT). processLineCodes detects it and resolves _run.
+      this._shellProcess.stdin.write(
+        `print(r"""${LineCodes.RunCancelledCode}""")\n`,
+        this.onWriteComplete,
+      );
+
+      // Send SIGINT to trigger KeyboardInterrupt in saspy's submit() loop.
+      try {
+        process.kill(this._shellProcess.pid, "SIGINT");
+      } catch {
+        // SIGINT unsupported (e.g., Windows) — fallback: kill + rebuild
+        this._shellProcess.kill();
+        this._workDirectory = undefined;
+        this._runReject?.(
+          new Error(
+            "SAS execution cancelled. Session will be rebuilt on next run.",
+          ),
+        );
+      }
+    } catch (error) {
+      this._runReject?.(error);
+    }
   };
 
   /**
@@ -310,24 +364,14 @@ else:
   /**
    * Flushes the SAS log in chunks of [chunkSize] length,
    * writing each chunk to stdout.
+   *
+   * The work-dir setup log (ll_init) is fully consumed during establishConnection,
+   * not here — see the SessionCreatedCode handling in processLineCodes.
    */
   private fetchLog = async (skipPageHeaders?: boolean): Promise<void> => {
-    // Below SASPy V5.14.0, we can't get the log line type
-    // this._shellProcess.stdin.write(`print(ll['LOG'])\n`, this.onWriteComplete);
-    // from SASPy V5.14.0, it provides an option to get line type in log
-    // FIXME: The log of code for work directory should be diagnoticed together with
-    // the first run code, otherwise, as current implentation, the diagnotitics would
-    // think the actual code has completed after parsing the log of code for working
-    // directory
-    // - update unsubscribe, or
-    // - delay the parsing log of code for working directory
     const skipPageHeadersValue = skipPageHeaders ? "True" : "False";
     this._shellProcess.stdin.write(
       `
-if ll_init is not None:
-    print(ll_init['LOG'])
-    ll_init = None
-
 if enable_diagnostic:
     for lln in ll["LOG"]:
         if ${skipPageHeadersValue}:
@@ -343,27 +387,61 @@ else:
   };
 
   /**
-   * Handles stderr output from the powershell child process.
+   * Handles stderr output from the Python child process.
+   * Provides friendly error messages for common saspy failures.
    * @param chunk a buffer of stderr output from the child process.
    */
   private onShellStdErr = (chunk: Buffer): void => {
     const msg = chunk.toString("utf8");
     console.warn("shellProcess stderr: " + msg);
+
+    // Python/saspy not installed
+    if (/spawn .+ ENOENT: Error/i.test(msg)) {
+      this._shellProcess.kill();
+      this._workDirectory = undefined;
+      this._runReject?.(
+        new Error(
+          `Failed to start Python ("${this._config.pythonpath}"). ` +
+            "Please verify the Python path in your SASPy connection profile.",
+        ),
+      );
+      return;
+    }
+
+    // saspy import failed (ModuleNotFoundError / ImportError)
+    if (/ModuleNotFoundError: No module named 'saspy'|ImportError: cannot import name/i.test(msg)) {
+      this._shellProcess.kill();
+      this._workDirectory = undefined;
+      this._runReject?.(
+        new Error(
+          "saspy is not installed in the configured Python environment. " +
+            "Please install it with: pip install saspy",
+        ),
+      );
+      return;
+    }
+
+    // saspy connection failure (cfgname not found, SAS not available, etc.)
+    if (/We failed in getConnection|Setup error/i.test(msg)) {
+      this._shellProcess.kill();
+      this._workDirectory = undefined;
+      this._runReject?.(
+        new Error(
+          "Failed to create a SAS session via saspy. " +
+            "Please verify your saspy configuration (cfgname) and that SAS is available.\n" +
+            `Details: ${msg.trim()}`,
+        ),
+      );
+      return;
+    }
+
+    // Generic stderr — reject with a reference to the console log
     if (/[^.> ]/.test(msg)) {
-      this._runReject(
+      this._runReject?.(
         new Error(
           "There was an error executing the SAS Program.\nSee console log for more details.",
         ),
       );
-    }
-    // If we encountered an error in setup, we need to go through everything again
-    if (
-      /^We failed in getConnection|Setup error|spawn .+ ENOENT: Error/i.test(
-        msg,
-      )
-    ) {
-      this._shellProcess.kill();
-      this._workDirectory = undefined;
     }
   };
 
@@ -402,15 +480,18 @@ else:
       }
 
       if (!this.processLineCodes(line)) {
-        if (!this._workDirectory) {
+        if (!this._workDirectory && !this._pendingWorkDirectory) {
           const foundWorkDirectory = this.fetchWorkDirectory(line);
           if (foundWorkDirectory === undefined) {
             return;
           }
 
           if (foundWorkDirectory) {
-            this._workDirectory = foundWorkDirectory.trim();
-            this._runResolve();
+            // Defer setting _workDirectory and resolving until SessionCreatedCode
+            // is detected. This keeps remaining work-dir setup log lines routed
+            // to _onSessionLogFn (not _onExecutionLogFn), preventing the
+            // diagnostics parser from misinterpreting setup log as user code.
+            this._pendingWorkDirectory = foundWorkDirectory.trim();
             updateStatusBarItem(true);
             return;
           }
@@ -431,6 +512,20 @@ else:
   };
 
   private processLineCodes(line: string): boolean {
+    // saspy import failed — reject with friendly message
+    if (line.startsWith("SASPY_IMPORT_ERROR:")) {
+      this._shellProcess?.kill();
+      this._workDirectory = undefined;
+      this._pendingWorkDirectory = undefined;
+      this._runReject?.(
+        new Error(
+          "saspy is not installed in the configured Python environment. " +
+            "Please install it with: pip install saspy",
+        ),
+      );
+      return true;
+    }
+
     if (line.endsWith(LineCodes.RunEndCode)) {
       // run completed
       this.fetchResults();
@@ -438,6 +533,13 @@ else:
     }
 
     if (line.includes(LineCodes.SessionCreatedCode)) {
+      // Session fully created — finalize work directory now that all setup
+      // log lines have been consumed as session log.
+      if (this._pendingWorkDirectory) {
+        this._workDirectory = this._pendingWorkDirectory;
+        this._pendingWorkDirectory = undefined;
+        this._runResolve();
+      }
       return true;
     }
 

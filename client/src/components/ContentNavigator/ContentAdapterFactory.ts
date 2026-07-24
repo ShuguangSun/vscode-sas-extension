@@ -3,6 +3,7 @@
 import ItcServerAdapter from "../../connection/itc/ItcServerAdapter";
 import RestContentAdapter from "../../connection/rest/RestContentAdapter";
 import RestServerAdapter from "../../connection/rest/RestServerAdapter";
+import SaspyServerAdapter from "../../connection/saspy/SaspyServerAdapter";
 import { ConnectionType, ProfileWithFileRootOptions } from "../profile";
 import {
   ContentAdapter,
@@ -27,6 +28,11 @@ class ContentAdapterFactory {
       case `${ConnectionType.IOM}.${ContentSourceType.SASServer}`:
       case `${ConnectionType.COM}.${ContentSourceType.SASServer}`:
         return new ItcServerAdapter(
+          fileNavigationCustomRootPath,
+          fileNavigationRoot,
+        );
+      case `${ConnectionType.SASPY}.${ContentSourceType.SASServer}`:
+        return new SaspyServerAdapter(
           fileNavigationCustomRootPath,
           fileNavigationRoot,
         );

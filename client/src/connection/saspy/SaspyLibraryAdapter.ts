@@ -1,5 +1,6 @@
 // Copyright © 2024, SAS Institute Inc., Cary, NC, USA.  All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+import type { SortModelItem } from "ag-grid-community";
 import { commands, l10n } from "vscode";
 
 import { ChildProcessWithoutNullStreams } from "child_process";
@@ -9,9 +10,11 @@ import {
   LibraryAdapter,
   LibraryItem,
   TableData,
+  TableQuery,
   TableRow,
 } from "../../components/LibraryNavigator/types";
-import { Column, ColumnCollection } from "../rest/api/compute";
+import { Column, ColumnCollection, TableInfo } from "../rest/api/compute";
+import { getColumnIconType } from "../util";
 import { runCode } from "./CodeRunner";
 import { Config, LineCodes } from "./types";
 
@@ -48,7 +51,8 @@ class SaspyLibraryAdapter implements LibraryAdapter {
     const sql = `
       %let OUTPUT;
       proc sql;
-        select catx(',', name, type, varnum) as column into: OUTPUT separated by '~'
+        select catx('|', name, type, varnum, format, informat, label, length)
+          into: OUTPUT separated by '~'
         from sashelp.vcolumn
         where libname='${item.library}' and memname='${item.name}'
         order by varnum;
@@ -61,12 +65,17 @@ class SaspyLibraryAdapter implements LibraryAdapter {
     );
 
     const columns = columnLines.map((lineText): Column => {
-      const [name, type, index] = lineText.split(",");
+      const [name, type, index, format, informat, label, length] =
+        lineText.split("|");
 
       return {
         name,
-        type,
+        type: getColumnIconType({ type, format: { name: format || "" } }),
         index: parseInt(index, 10),
+        label: label || undefined,
+        length: parseInt(length, 10) || undefined,
+        format: format ? { name: format } : undefined,
+        informat: informat ? { name: informat } : undefined,
       };
     });
 
@@ -115,11 +124,15 @@ class SaspyLibraryAdapter implements LibraryAdapter {
     item: LibraryItem,
     start: number,
     limit: number,
+    sortModel: SortModelItem[],
+    query: TableQuery | undefined,
   ): Promise<TableData> {
     const { rows: rawRowValues, count } = await this.getDatasetInformation(
       item,
       start,
       limit,
+      sortModel,
+      query,
     );
 
     const rows = rawRowValues.map((line, idx: number): TableRow => {
@@ -143,12 +156,14 @@ class SaspyLibraryAdapter implements LibraryAdapter {
       start === 0
         ? {
             columns: ["INDEX"].concat(
-              (await this.getColumns(item)).items.map((column) => column.name),
+              (await this.getColumns(item)).items.flatMap((column) =>
+                column.name ? [column.name] : [],
+              ),
             ),
           }
         : {};
 
-    const { rows } = await this.getRows(item, start, limit);
+    const { rows } = await this.getRows(item, start, limit, [], undefined);
 
     rows.unshift(columns);
 
@@ -208,27 +223,120 @@ class SaspyLibraryAdapter implements LibraryAdapter {
     return { items: tables, count: -1 };
   }
 
+  public async getTableInfo(item: LibraryItem): Promise<TableInfo> {
+    const basicInfo: TableInfo = {
+      bookmarkLength: 0,
+      columnCount: 0,
+      compressionRoutine: "",
+      creationTimeStamp: "",
+      encoding: "",
+      engine: "",
+      extendedType: "",
+      label: "",
+      libref: item.library,
+      logicalRecordCount: 0,
+      modifiedTimeStamp: "",
+      name: item.name,
+      physicalRecordCount: 0,
+      recordLength: 0,
+      rowCount: 0,
+      type: "DATA",
+    };
+
+    try {
+      const sql = `
+        %let OUTPUT;
+        proc sql;
+          select catx('|', memtype, nvar, nobs, crdate, modate, engine, label,
+                       compress, encrypt, encoding, reclength)
+            into: OUTPUT separated by '~'
+          from sashelp.vtable
+          where libname='${item.library}' and memname='${item.name}';
+        quit;
+        %put <TABLEINFO> &OUTPUT; %put </TABLEINFO>;
+      `;
+
+      const output = await this.runCode(sql, "<TABLEINFO>", "</TABLEINFO>");
+      const infoLines = processQueryRows(output);
+
+      if (infoLines.length === 0) {
+        return basicInfo;
+      }
+
+      const [
+        memtype,
+        nvar,
+        nobs,
+        crdate,
+        modate,
+        engine,
+        label,
+        compress,
+        ,
+        encoding,
+        reclength,
+      ] = infoLines[0].split("|");
+
+      return {
+        ...basicInfo,
+        columnCount: parseInt(nvar, 10) || 0,
+        rowCount: parseInt(nobs, 10) || 0,
+        logicalRecordCount: parseInt(nobs, 10) || 0,
+        physicalRecordCount: parseInt(nobs, 10) || 0,
+        creationTimeStamp: crdate || "",
+        modifiedTimeStamp: modate || "",
+        engine: engine || "",
+        label: label || "",
+        compressionRoutine: compress || "",
+        encoding: encoding || "",
+        recordLength: parseInt(reclength, 10) || 0,
+        type: memtype === "VIEW" ? "VIEW" : "DATA",
+      };
+    } catch (error) {
+      console.warn("Failed to get table info:", error);
+      return basicInfo;
+    }
+  }
+
   protected async getDatasetInformation(
     item: LibraryItem,
     start: number,
     limit: number,
+    sortModel: SortModelItem[] = [],
+    query: TableQuery | undefined = undefined,
   ): Promise<{ rows: Array<string[]>; count: number }> {
     const maxTableNameLength = 32;
     const tempTable = `${item.name}${hms()}${start}`.substring(
       0,
       maxTableNameLength,
     );
+
+    // Build WHERE clause from query filter
+    const filterValue = query?.filterValue?.trim() || "";
+    const whereClause = filterValue
+      ? `where %nrstr(${filterValue});`
+      : "";
+
+    // Build sort string from sortModel (convert to SAS syntax)
+    const sortString = sortModel
+      .map((col) =>
+        col.sort === "desc" ? `descending ${col.colId}` : col.colId,
+      )
+      .join(" ");
+
     const code = `
       options nonotes nosource nodate nonumber;
       %let COUNT;
       proc sql;
-        SELECT COUNT(1) into: COUNT FROM  ${item.library}.${item.name};
+        SELECT COUNT(1) into: COUNT FROM  ${item.library}.${item.name}
+        ${filterValue ? `where %nrstr(${filterValue})` : ""};
       quit;
       data work.${tempTable};
         set ${item.library}.${item.name};
+        ${whereClause}
         if ${start + 1} <= _N_ <= ${start + limit} then output;
       run;
-
+      ${sortString ? `proc sort data=work.${tempTable}; by ${sortString}; run;` : ""}
       filename out temp;
       proc json nokeys out=out pretty; export work.${tempTable}; run;
 
@@ -249,7 +357,9 @@ class SaspyLibraryAdapter implements LibraryAdapter {
     // Extract result count
     const countRegex = /<Count>(.*)<\/Count>/;
     const countMatches = output.match(countRegex);
-    const count = parseInt(countMatches[1].replace(/\s|\n/gm, ""), 10);
+    const count = countMatches
+      ? parseInt(countMatches[1].replace(/\s|\n/gm, ""), 10)
+      : 0;
     output = output.replace(countRegex, "");
 
     const rows = output.replace(/\n|\t/gm, "").slice(output.indexOf("{"));

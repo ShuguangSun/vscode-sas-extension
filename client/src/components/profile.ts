@@ -94,7 +94,7 @@ export interface SSHProfile extends BaseProfile {
   privateKeyFilePath?: string;
 }
 
-export interface SASPYProfile extends BaseProfile {
+export interface SASPYProfile extends BaseProfile, ProfileWithFileRootOptions {
   connectionType: ConnectionType.SASPY;
   cfgname: string;
   pythonpath: string;
@@ -620,8 +620,22 @@ export class ProfileConfig {
 
       await this.upsertProfile(name, profileClone);
     } else if (profileClone.connectionType === ConnectionType.SASPY) {
-      profileClone.cfgname = "";
-      // profileClone.sasOptions = [];
+      profileClone.cfgname = await createInputTextBox(
+        ProfilePromptType.Cfgname,
+        profileClone.cfgname,
+      );
+      if (profileClone.cfgname === undefined) {
+        return;
+      }
+
+      profileClone.pythonpath = await createInputTextBox(
+        ProfilePromptType.PYTHONpath,
+        profileClone.pythonpath || "python",
+      );
+      if (profileClone.pythonpath === undefined) {
+        return;
+      }
+
       await this.upsertProfile(name, profileClone);
     } else if (profileClone.connectionType === ConnectionType.COM) {
       profileClone.sasOptions = [];
@@ -850,9 +864,11 @@ const input: ProfilePromptInput = {
     description: l10n.t("Enter your SAS server cfgname."),
   },
   [ProfilePromptType.PYTHONpath]: {
-    title: l10n.t("Server Path"),
-    placeholder: l10n.t("Enter the server path"),
-    description: l10n.t("Enter the server path of the PYTHON Executable."),
+    title: l10n.t("Python Path"),
+    placeholder: l10n.t("Enter the Python executable path"),
+    description: l10n.t(
+      "Enter the path to the Python executable (e.g., python, python3, or full path).",
+    ),
   },
 };
 
